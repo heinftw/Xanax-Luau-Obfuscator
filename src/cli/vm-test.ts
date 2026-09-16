@@ -21,14 +21,14 @@ print(x)
 `;
 }
 
-console.log("=== VM-Test: Kompilieren und Ausführen ===\n");
-console.log("Quellcode:");
+console.log("=== VM-Test: Compile and Execute ===\n");
+console.log("Source code:");
 console.log(source);
 console.log("\n---");
 
 const { tokens, errors } = lex(source);
 if (errors.length > 0) {
-  console.error("Lexer-Fehler:", errors);
+  console.error("Lexer errors:", errors);
   process.exit(1);
 }
 
@@ -36,8 +36,8 @@ const ast = parse(tokens);
 const obfuscated = obfuscate(ast, { renameLocals: true, preserveGlobals: true });
 const chunk = compile(obfuscated);
 
-console.log("\nK (Konstanten):", JSON.stringify(chunk.K, null, 2));
-console.log("\nCode (erste 50):", chunk.code.slice(0, 50).join(","));
+console.log("\nK (Constants):", JSON.stringify(chunk.K, null, 2));
+console.log("\nCode (first 50):", chunk.code.slice(0, 50).join(","));
 
 const mockEnv: Record<string, unknown> = {
   print: (...a: unknown[]) => console.log("[VM]", ...a),
@@ -194,13 +194,13 @@ const mockEnv: Record<string, unknown> = {
 
 mockEnv._G = mockEnv;
 
-console.log("\n--- Ausführung ---\n");
+console.log("\n--- Execution ---\n");
 
 try {
   const result = runVM(chunk.K, chunk.code, mockEnv, 0, chunk.protos || []);
-  console.log("\nRückgabewert:", result);
-  console.log("\n✓ VM-Test erfolgreich");
+console.log("\nReturn value:", result);
+console.log("\nVM test successful");
 } catch (err) {
-  console.error("\n✗ VM-Fehler:", err);
+  console.error("\nVM error:", err);
   process.exit(1);
 }

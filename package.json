@@ -1,7 +1,7 @@
 {
-  "name": "luau-obfuscator",
-  "version": "0.1.0",
-  "description": "Luau parser and obfuscator with full Luau support",
+  "name": "xanax-obfuscator",
+  "version": "1.0.0",
+  "description": "Xanax Protection - Advanced Luau obfuscator with full language support, multi-pass AST transformations, and dual virtual machine architectures for maximum code protection.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

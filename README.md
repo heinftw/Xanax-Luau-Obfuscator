@@ -1,6 +1,6 @@
 <div align="center">
 
-# Clyde-Luau-Obfuscator
+# Xanax-Luau-Obfuscator
 
 **Advanced Luau Obfuscator with VM-Based Protection**
 
@@ -9,7 +9,7 @@ A high-performance Luau obfuscation toolkit featuring full language support, mul
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3+-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](./LICENSE)
-[![Stars](https://img.shields.io/github/stars/sfr-development/Clyde-Luau-Obfuscator?style=flat-square)](https://github.com/sfr-development/Clyde-Luau-Obfuscator/stargazers)
+[![Stars](https://img.shields.io/github/stars/sfr-development/Xanax-Luau-Obfuscator?style=flat-square)](https://github.com/sfr-development/Xanax-Luau-Obfuscator/stargazers)
 
 </div>
 
@@ -17,7 +17,7 @@ A high-performance Luau obfuscation toolkit featuring full language support, mul
 
 ## Overview
 
-Clyde is a from-scratch Luau obfuscator built entirely in TypeScript. It implements a complete **Lexer > Parser > AST > Obfuscator > VM** pipeline with no external parsing dependencies. Every stage — tokenization, full Luau grammar parsing (including type annotations), AST transformations, bytecode compilation, and VM code generation — is hand-written for maximum control and output quality.
+Xanax is a from-scratch Luau obfuscator built entirely in TypeScript. It implements a complete **Lexer > Parser > AST > Obfuscator > VM** pipeline with no external parsing dependencies. Every stage — tokenization, full Luau grammar parsing (including type annotations), AST transformations, bytecode compilation, and VM code generation — is hand-written for maximum control and output quality.
 
 ### Key Features
 
@@ -126,7 +126,7 @@ graph TD
 
 ```mermaid
 graph TD
-    ROOT["Clyde-Luau-Obfuscator/"] --> SRC["src/"]
+    ROOT["Xanax-Luau-Obfuscator/"] --> SRC["src/"]
     ROOT --> PUB["public/"]
     
     SRC --> LEX["lexer/<br/><i>Tokenizer + token types</i>"]
@@ -170,8 +170,8 @@ graph TD
 ### Installation
 
 ```bash
-git clone https://github.com/sfr-development/Clyde-Luau-Obfuscator.git
-cd Clyde-Luau-Obfuscator
+git clone https://github.com/sfr-development/Xanax-Luau-Obfuscator.git
+cd Xanax-Luau-Obfuscator
 npm install
 npm run build
 ```
@@ -256,9 +256,9 @@ Obfuscates Luau source code with configurable options.
 ## Programmatic Usage
 
 ```typescript
-import { lex, parse, obfuscate, printChunk } from "clyde";
-import { compile } from "clyde/vm/Compiler";
-import { generateVM } from "clyde/vm/vm-gen";
+import { lex, parse, obfuscate, printChunk } from "xanax";
+import { compile } from "xanax/vm/Compiler";
+import { generateVM } from "xanax/vm/vm-gen";
 
 // Basic obfuscation
 const { tokens } = lex('local x = "hello world"');
@@ -319,11 +319,11 @@ Both VMs support three protection levels:
 
 ## Star History
 
-<a href="https://star-history.com/#sfr-development/Clyde-Luau-Obfuscator&Date">
+<a href="https://star-history.com/#sfr-development/Xanax-Luau-Obfuscator&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=sfr-development/Clyde-Luau-Obfuscator&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=sfr-development/Clyde-Luau-Obfuscator&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=sfr-development/Clyde-Luau-Obfuscator&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=sfr-development/Xanax-Luau-Obfuscator&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=sfr-development/Xanax-Luau-Obfuscator&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=sfr-development/Xanax-Luau-Obfuscator&type=Date" />
  </picture>
 </a>
 

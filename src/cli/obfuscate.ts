@@ -45,7 +45,7 @@ end
 
 const { tokens, errors } = lex(source);
 if (errors.length > 0) {
-  console.error("Lexer-Fehler:", errors);
+  console.error("Lexer errors:", errors);
   process.exit(1);
 }
 
@@ -80,7 +80,7 @@ if (vmOpt) {
 
 if (outFile) {
   writeFileSync(outFile, output, "utf-8");
-  console.error(`Obfuskiert nach ${outFile}`);
+  console.error(`Obfuscated to ${outFile}`);
 } else {
   console.log(output);
 }

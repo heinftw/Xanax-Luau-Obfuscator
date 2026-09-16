@@ -19,14 +19,14 @@ end
 
 const { tokens, errors } = lex(source);
 if (errors.length > 0) {
-  console.error("Lexer-Fehler:", errors);
+  console.error("Lexer errors:", errors);
   process.exit(1);
 }
 
 const ast = parse(tokens);
 
 if (validateOnly) {
-  console.log("OK – Parse erfolgreich");
+  console.log("OK - Parse successful");
 } else {
   console.log(JSON.stringify(ast, null, 2));
 }

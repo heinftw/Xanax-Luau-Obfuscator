@@ -14,7 +14,7 @@ print("Hello " .. x)
 const { tokens, errors } = lex(source);
 
 if (errors.length > 0) {
-  console.error("Fehler:");
+  console.error("Errors:");
   for (const e of errors) {
     console.error(`  ${e.loc.start.line}:${e.loc.start.column}: ${e.message}`);
   }

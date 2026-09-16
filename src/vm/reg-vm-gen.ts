@@ -3685,7 +3685,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
     console.log(`[RegVM] Blob: final output = ${output.length} chars`);
   }
 
-  if (!options._noWatermark) {
+  if (false && !options._noWatermark) {
     const art = [
       `_________ .__            .___       __________                __                 __  .__                ____   ____________  `,
       `\\_   ___ \\|  | ___.__. __| _/____   \\______   \\_______  _____/  |_  ____   _____/  |_|__| ____   ____   \\   \\ /   /\\_____  \\ `,

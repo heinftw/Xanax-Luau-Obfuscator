@@ -3666,7 +3666,7 @@ export function generateVM(chunk: BytecodeChunk, options: VMGenOptions = {}): st
       artLines[li] = artLines[li].trimEnd() + ' '.repeat(spaces);
     }
 
-    const watermark = `--[[\n${artLines.join('\n')}\n]]\n`;
+    const watermark = ``;
     output = watermark + output;
   }
 

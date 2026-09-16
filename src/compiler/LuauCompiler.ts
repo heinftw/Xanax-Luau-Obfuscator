@@ -345,7 +345,7 @@ export function validate(source: string): ValidationResult {
     }
   } catch (parseErr: any) {
     errors.push({
-      message: `Parser-Fehler: ${parseErr.message}`,
+      message: `Parse error: ${parseErr.message}`,
       severity: "error",
     });
     return {
@@ -421,7 +421,7 @@ export function validate(source: string): ValidationResult {
   if (unknownGlobals.length <= 20) {
     for (const g of unknownGlobals) {
       errors.push({
-        message: `Unbekannte globale Variable: '${g}' (möglicherweise Tippfehler)`,
+        message: `Unknown global variable: '${g}' (possibly misspelled)`,
         severity: "warning",
       });
     }
@@ -433,7 +433,7 @@ export function validate(source: string): ValidationResult {
     output = printChunk(ast);
   } catch (printErr: any) {
     errors.push({
-      message: `Printer-Fehler: ${printErr.message}`,
+      message: `Printer error: ${printErr.message}`,
       severity: "error",
     });
   }

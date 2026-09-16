@@ -115,6 +115,16 @@ app.post("/api/obfuscate", (req: express.Request, res: express.Response) => {
       output = oneLineOpt ? printChunkOneLine(obfuscated) : printChunk(obfuscated);
     }
 
+    if (oneLineOpt && vmType !== "none") {
+      output = output
+        .split("\n")
+        .map(l => l.trim())
+        .filter(l => l.length > 0 && !l.startsWith("--"))
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
     res.json({ output });
   } catch (err: any) {
     console.error("Obfuscation error:", err);
@@ -124,7 +134,7 @@ app.post("/api/obfuscate", (req: express.Request, res: express.Response) => {
 
 app.listen(PORT, () => {
   const url = `http://localhost:${PORT}`;
-  console.log(`\nClyde Obfuscator Server running at: ${url}`);
+  console.log(`\nXanax Obfuscator Server running at: ${url}`);
   console.log("Press CTRL+C to terminate.\n");
 
   exec(`start ${url}`, (err) => {
