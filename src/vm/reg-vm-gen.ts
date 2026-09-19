@@ -45,6 +45,11 @@ interface BuildCtx {
   opcodeEncode: number[];
   opcodeDecode: number[];
   doShuffle: boolean;
+
+  // Per-function opcode isolation: each proto gets its own permutation
+  // derived from master seed + tree index + depth (dispatch keeps a
+  // separate global alphabet in opcodeEncode/opcodeDecode).
+  perProtoOpcodes: boolean;
   encodeStrings: boolean;
   xorKey: number;
   xorStep: number;
@@ -103,6 +108,11 @@ interface NameMap {
   tPack: string;
   tUnpack: string;
   ic: string;
+
+  // Current function's opcode decode table (stored byte -> real op).
+  opDec: string;
+  // Global dispatch alphabet table (real op -> dispatch constant).
+  gEnc: string;
 
   bPcall: string;
   bXpcall: string;
@@ -179,6 +189,7 @@ function createNameMap(level: RegVMLevel): NameMap {
       retFlag: "_rf", retVals: "_rv",
       tPack: "_tpack", tUnpack: "_tunpack",
       ic: "_ic",
+      opDec: "_opDec", gEnc: "_gEnc",
       bPcall: "_pcall", bXpcall: "_xpcall", bSelect: "_select", bType: "_type",
       bTconcat: "_tconcat", bTcreate: "_tcreate", bMfloor: "_mfloor", bIpairs: "_ipairs",
       bTostring: "_tostring", bRawget: "_rawget", bSetmeta: "_setmeta",
@@ -197,6 +208,7 @@ function createNameMap(level: RegVMLevel): NameMap {
     retFlag: randomName(3), retVals: randomName(3),
     tPack: randomName(3), tUnpack: randomName(3),
     ic: randomName(3),
+    opDec: randomName(3), gEnc: randomName(2),
     bPcall: randomName(3), bXpcall: randomName(3), bSelect: randomName(3), bType: randomName(3),
     bTconcat: randomName(3), bTcreate: randomName(3), bMfloor: randomName(3), bIpairs: randomName(3),
     bTostring: randomName(3), bRawget: randomName(3), bSetmeta: randomName(3),
@@ -287,6 +299,57 @@ function shuffleOpcodes(doShuffle: boolean): { encode: number[]; decode: number[
   return { encode, decode };
 }
 
+// ---------------------------------------------------------------------------
+// Per-function opcode isolation
+//
+// Every function prototype (including the root chunk) gets its own opcode
+// permutation, derived deterministically from a subkey:
+//
+//     subkey = mix(master seed, proto index in tree, depth)
+//
+// where "proto index in tree" is a pre-order DFS numbering (root = 0) and
+// depth is 0 for the root. The permutation itself is generated with the same
+// Fisher-Yates walk as the dispatch alphabet, but from the subkey-seeded RNG,
+// so identical seeds reproduce identical per-proto alphabets. The resulting
+// decode table (stored byte -> real op) is stored alongside the proto data;
+// closures capture it on entry and the dispatch loop applies it before
+// dispatching, so each function body is unreadable without the map of the
+// exact function it belongs to.
+// ---------------------------------------------------------------------------
+
+const PROTO_KEY_MIX_A = 0x9E3779B1;
+const PROTO_KEY_MIX_B = 0x85EBCA77;
+const PROTO_KEY_MIX_C = 0xC2B2AE35;
+
+function deriveProtoOpcodeSubkey(masterSeed: number, treeIndex: number, depth: number): number {
+  let k = (masterSeed ^ 0x5A5A5A5D) >>> 0;
+  k = Math.imul(k ^ ((treeIndex + 1) >>> 0), PROTO_KEY_MIX_A) >>> 0;
+  k = (k + Math.imul((depth + 1) >>> 0, PROTO_KEY_MIX_B)) >>> 0;
+  k = Math.imul(k ^ (k >>> 15), PROTO_KEY_MIX_C) >>> 0;
+  return k >>> 0;
+}
+
+function identityPermutation(): number[] {
+  const id: number[] = [];
+  for (let i = 0; i < REG_OPCODE_COUNT; i++) id[i] = i;
+  return id;
+}
+
+function generateProtoOpcodeMap(subkey: number): { encode: number[]; decode: number[] } {
+  const saved = _rngState;
+  seedRandom(subkey);
+  const perm = shuffleOpcodes(true);
+  _rngState = saved;
+  return perm;
+}
+
+// Serializes a byte-indexed table (index 0 is meaningful, so the Lua table
+// constructor must pin index 0 explicitly and let the rest fill 1..n).
+function serializeByteTable(bytes: number[]): string {
+  return `{[0]=${bytes[0]}${bytes.length > 1 ? "," + bytes.slice(1).join(",") : ""}}`;
+}
+
+
 function generateArgPerms(doRemap: boolean): number[][] {
   const ALL_PERMS = [[1,2,3],[1,3,2],[2,1,3],[2,3,1],[3,1,2],[3,2,1]];
   const perms: number[][] = [];
@@ -317,9 +380,10 @@ function mapRegBytecode(code: number[], encode: number[], argPerm: number[][]): 
   return out;
 }
 
-function mapRegChunk(chunk: RegBytecodeChunk, encode: number[], argPerm: number[][]): void {
-  chunk.code = mapRegBytecode(chunk.code, encode, argPerm);
-  if (chunk.protos) for (const p of chunk.protos) mapRegChunk(p, encode, argPerm);
+function mapRegChunk(chunk: RegBytecodeChunk, argPerm: number[][]): void {
+  const map = chunk.opcodeMap;
+  chunk.code = map ? mapRegBytecode(chunk.code, map, argPerm) : chunk.code;
+  if (chunk.protos) for (const p of chunk.protos) mapRegChunk(p, argPerm);
 }
 
 const SPIRAL_PRIMES = [
@@ -418,16 +482,43 @@ function serializeRegCode(code: number[], ctx?: BuildCtx): string {
   return `{${code.join(",")}}`;
 }
 
-function serializeRegProtos(protos: RegBytecodeChunk[] | undefined, ctx: BuildCtx): string {
-  if (!protos || protos.length === 0) return "{}";
+function serializeRegProtos(
+  protos: RegBytecodeChunk[] | undefined,
+  ctx: BuildCtx,
+  startIndex: number,
+  depth: number,
+): { text: string; nextIndex: number } {
+  if (!protos || protos.length === 0) return { text: "{}", nextIndex: startIndex };
   const pk = ctx.protoKeys;
   const usePositional = ctx.level !== "debug";
   const items: string[] = [];
+  let nextIndex = startIndex;
   for (const p of protos) {
-    const mappedCode = ctx.doShuffle ? mapRegBytecode(p.code, ctx.opcodeEncode, ctx.argPerm) : p.code;
+    const treeIndex = nextIndex;
+
+    // Per-function opcode isolation: derive this proto's own opcode
+    // permutation from master seed + index in tree + depth. Without
+    // shuffling the alphabet stays identity.
+    let encode: number[];
+    let decode: number[];
+    if (ctx.perProtoOpcodes) {
+      const subkey = deriveProtoOpcodeSubkey(ctx.seed, treeIndex, depth);
+      const perm = generateProtoOpcodeMap(subkey);
+      encode = perm.encode;
+      decode = perm.decode;
+    } else {
+      encode = identityPermutation();
+      decode = identityPermutation();
+    }
+    p.opcodeMap = encode;
+
+    const mappedCode = mapRegBytecode(p.code, encode, ctx.argPerm);
     const sK = serializeConstants(p.K, ctx);
     const sC = serializeRegCode(mappedCode, ctx);
-    const sP = serializeRegProtos(p.protos, ctx);
+    const sD = serializeByteTable(decode);
+    const sub = serializeRegProtos(p.protos, ctx, treeIndex + 1, depth + 1);
+    const sP = sub.text;
+    nextIndex = sub.nextIndex;
     let sU = "nil";
     if (p.upvalues && p.upvalues.length > 0) {
       sU = `{${p.upvalues.map(uv => `{${uv[0]},${uv[1]}}`).join(",")}}`;
@@ -437,12 +528,12 @@ function serializeRegProtos(protos: RegBytecodeChunk[] | undefined, ctx: BuildCt
     const isVA = p.isVararg ? "true" : "false";
     if (usePositional) {
 
-      items.push(`{${sK},${sC},${sP},${sU},${nP},${mR},${isVA}}`);
+      items.push(`{${sK},${sC},${sP},${sU},${nP},${mR},${isVA},${sD}}`);
     } else {
-      items.push(`{${pk.pK}=${sK},${pk.pC}=${sC},${pk.pP}=${sP},${pk.pU}=${sU},${pk.pN}=${nP},mR=${mR},vA=${isVA}}`);
+      items.push(`{${pk.pK}=${sK},${pk.pC}=${sC},${pk.pP}=${sP},${pk.pU}=${sU},${pk.pN}=${nP},mR=${mR},vA=${isVA},opD=${sD}}`);
     }
   }
-  return `{${items.join(",")}}`;
+  return { text: `{${items.join(",")}}`, nextIndex };
 }
 
 const REG_OP_NAMES: string[] = [
@@ -616,12 +707,16 @@ registerHandler(RegOp.CLOSURE, (n, ctx) => {
   const gN = pos ? "[5]" : `.${pN}`;
   const gMR = pos ? "[6]" : ".mR";
   const gVA = pos ? "[7]" : ".vA";
+  // Field 8 / .opD is the proto's own opcode decode table; the closure
+  // hands it to run so dispatch inside the new function uses the proto's
+  // own opcode alphabet.
+  const gD = pos ? "[8]" : ".opD";
   return `do local proto=${n.protos}[B+1];if proto then ` +
     `local nU={};if proto${gU} then for _ui,_ud in ${n.bIpairs}(proto${gU}) do ` +
     `if _ud[1]==1 then local _b;for _oi=1,#${n.openUVs} do if ${n.openUVs}[_oi][2]==_ud[2]+1 then _b=${n.openUVs}[_oi];break end end;` +
     `if not _b then _b={${n.R},_ud[2]+1};${n.openUVs}[#${n.openUVs}+1]=_b end;nU[_ui]=_b ` +
     `else nU[_ui]=${n.upvalues}[_ud[2]+1] end end end;` +
-    `${n.R}[A+1]=function(...) return ${n.run}(proto${gK},proto${gC},proto${gP},proto${gU} and nU or {},proto${gN},proto${gMR},proto${gVA},${n.env},...) end ` +
+    `${n.R}[A+1]=function(...) return ${n.run}(proto${gK},proto${gC},proto${gP},proto${gU} and nU or {},proto${gN},proto${gMR},proto${gVA},${n.env},proto${gD},...) end ` +
     `else ${n.R}[A+1]=nil end end`;
 });
 
@@ -1300,8 +1395,8 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
   const L: string[] = [];
 
   L.push(assignStyle
-    ? `${n.run}=function(${n.K},${n.code},${n.protos},${n.upvalues},${n.nParams},${n.maxRegs},_isVararg,${n.env},...)`
-    : `local function ${n.run}(${n.K},${n.code},${n.protos},${n.upvalues},${n.nParams},${n.maxRegs},_isVararg,${n.env},...)`);
+    ? `${n.run}=function(${n.K},${n.code},${n.protos},${n.upvalues},${n.nParams},${n.maxRegs},_isVararg,${n.env},${n.opDec},...)`
+    : `local function ${n.run}(${n.K},${n.code},${n.protos},${n.upvalues},${n.nParams},${n.maxRegs},_isVararg,${n.env},${n.opDec},...)`);
   L.push(`${n.protos}=${n.protos} or {}`);
   L.push(`${n.upvalues}=${n.upvalues} or {}`);
 
@@ -1497,6 +1592,24 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
   const useRot = ctx.rotSeed > 0;
   const opVar = randomName(2);
 
+  if (ctx.perProtoOpcodes) {
+    // Per-function opcode isolation at dispatch time: opcodes stored in this
+    // function's code array are encoded with THIS proto's own permutation.
+    // Decode through the proto's table (captured on closure entry; the root
+    // invocation receives the root's table), then translate the real opcode
+    // into the global dispatch alphabet used by the handler chain below.
+    L.push(`${n.opDec}=${n.opDec} or ${serializeByteTable(identityPermutation())}`);
+    // Global dispatch alphabet: real opcode -> dispatch constant. This is
+    // exactly the global encode permutation; handlers are keyed by it.
+    const gEncPairs: string[] = [];
+    for (let i = 0; i < REG_OPCODE_COUNT; i++) {
+      gEncPairs.push(`[${i}]=${ctx.opcodeEncode[i]}`);
+    }
+    L.push(`local ${n.gEnc}={${gEncPairs.join(",")}}`);
+  }
+  const decodeWrap = (expr: string): string =>
+    ctx.perProtoOpcodes ? `${n.gEnc}[${n.opDec}[${expr}]]` : expr;
+
   if (doMut) {
 
     const mkVar = randomName(2);
@@ -1505,9 +1618,9 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
       const rkVar = randomName(3);
 
       L.push(`local ${rkVar}=${n.bBand}(${ctx.rotSeed}+${n.ip}*${ctx.rotStep}+${n.ip}*${n.ip}*${ctx.rotStep2},0xFF)`);
-      L.push(`local ${opVar}=${n.bBxor}(${n.code}[${n.ip}],${rkVar},${mkVar})`);
+      L.push(`local ${opVar}=${decodeWrap(`${n.bBxor}(${n.code}[${n.ip}],${rkVar},${mkVar})`)}`);
     } else {
-      L.push(`local ${opVar}=${n.bBxor}(${n.code}[${n.ip}],${mkVar})`);
+      L.push(`local ${opVar}=${decodeWrap(`${n.bBxor}(${n.code}[${n.ip}],${mkVar})`)}`);
     }
 
     L.push(`local ${n.s1}=${n.code}[${n.ip}+1]`);
@@ -1525,9 +1638,9 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
     if (useRot) {
       const rkVar = randomName(3);
       L.push(`local ${rkVar}=${n.bBand}(${ctx.rotSeed}+${n.ip}*${ctx.rotStep}+${n.ip}*${n.ip}*${ctx.rotStep2},0xFF)`);
-      L.push(`local ${opVar}=${n.bBxor}(${n.code}[${n.ip}],${rkVar})`);
+      L.push(`local ${opVar}=${decodeWrap(`${n.bBxor}(${n.code}[${n.ip}],${rkVar})`)}`);
     } else {
-      L.push(`local ${opVar}=${n.code}[${n.ip}]`);
+      L.push(`local ${opVar}=${decodeWrap(`${n.code}[${n.ip}]`)}`);
     }
     L.push(`local ${n.s1}=${n.code}[${n.ip}+1]`);
     L.push(`local ${n.s2}=${n.code}[${n.ip}+2]`);
@@ -3364,7 +3477,8 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
 
   const ctx: BuildCtx = {
     level, seed, names, opcodeEncode: encode, opcodeDecode: decode,
-    doShuffle, encodeStrings, xorKey: 0, xorStep: 0, includeExecutor, protoKeys,
+    doShuffle, perProtoOpcodes: doShuffle,
+    encodeStrings, xorKey: 0, xorStep: 0, includeExecutor, protoKeys,
     debugTrace: options.debugTrace ?? (level === "debug"),
     sbox, sboxInverse, helixSeed, helixMul, cascadeKey, cascadeMul,
     checkKeyA, checkKeyB, checkStepA, checkStepB,
@@ -3417,15 +3531,33 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
   const dvNames = ["flat","xor-masked","binary-tree","grouped","table-dispatch","table-xor"];
   if (level !== "debug") console.log(`[RegVM] Dispatch: variant ${dispatchVariant} (${dvNames[dispatchVariant] || "unknown"})`);
 
-  const mappedCode = doShuffle ? mapRegBytecode(chunk.code, encode, ctx.argPerm) : chunk.code;
+  // The root chunk is a function too: it gets its own opcode permutation
+  // (tree index 0, depth 0). Its decode table travels with the other root
+  // data and seeds the first run() invocation; each nested proto carries
+  // its own table alongside its data.
+  let rootEncode: number[];
+  let rootDecode: number[];
+  if (doShuffle) {
+    const rootPerm = generateProtoOpcodeMap(deriveProtoOpcodeSubkey(seed, 0, 0));
+    rootEncode = rootPerm.encode;
+    rootDecode = rootPerm.decode;
+  } else {
+    rootEncode = identityPermutation();
+    rootDecode = identityPermutation();
+  }
+  chunk.opcodeMap = rootEncode;
+
+  const mappedCode = mapRegBytecode(chunk.code, rootEncode, ctx.argPerm);
 
   const dataK = serializeConstants(chunk.K, ctx);
   const dataC = serializeRegCode(mappedCode, ctx);
-  const dataP = serializeRegProtos(chunk.protos, ctx);
+  const dataP = serializeRegProtos(chunk.protos, ctx, 1, 1).text;
+  const dataDec = serializeByteTable(rootDecode);
 
   const dK = level === "debug" ? "_dK" : randomName(3);
   const dC = level === "debug" ? "_dC" : randomName(3);
   const dP = level === "debug" ? "_dP" : randomName(3);
+  const dDec = level === "debug" ? "_dDec" : randomName(3);
 
   const nP = chunk.nParams ?? 0;
   const mR = chunk.maxRegs ?? 0;
@@ -3445,7 +3577,8 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
     parts.push(`local ${dK}=${dataK}`);
     parts.push(`local ${dC}=${dataC}`);
     parts.push(`local ${dP}=${dataP}`);
-    parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env})`);
+    parts.push(`local ${dDec}=${dataDec}`);
+    parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env},${dDec})`);
     output = parts.join("\n");
   } else {
 
@@ -3472,10 +3605,11 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
     const vmCode = buildVMRuntime(ctx, true);
     allFragments.push({ code: vmCode, layer: Math.floor(rng() * 3) });
 
-    forwardDecls.push(dK, dC, dP);
+    forwardDecls.push(dK, dC, dP, dDec);
     allFragments.push({ code: `${dK}=${dataK}`, layer: Math.floor(rng() * 3) });
     allFragments.push({ code: `${dC}=${dataC}`, layer: Math.floor(rng() * 3) });
     allFragments.push({ code: `${dP}=${dataP}`, layer: Math.floor(rng() * 3) });
+    allFragments.push({ code: `${dDec}=${dataDec}`, layer: Math.floor(rng() * 3) });
 
     let chainCalls = "";
     if (encodeStrings) {
@@ -3633,12 +3767,12 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
           ['bxor', names.bBxor], ['band', names.bBand], ['type', names.bType],
           ['select', names.bSelect], ['tpack', names.tPack], ['tunpack', names.tUnpack],
           ['mfloor', names.bMfloor], ['setmeta', names.bSetmeta], ['tostring', names.bTostring],
-          ['dK', dK], ['dC', dC], ['dP', dP],
+          ['dK', dK], ['dC', dC], ['dP', dP], ['dDec', dDec],
         ];
         const wParts = chkVars.map(([l,v]) => `"${l}="..tostring(${v})`);
         parts.push(`warn("[ENV_CHECK] "..${wParts.join('.." "..') })`);
       }
-      parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env})`);
+      parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env},${dDec})`);
     } else {
 
       for (const frag of sorted) {
@@ -3651,12 +3785,12 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
           ['bxor', names.bBxor], ['band', names.bBand], ['type', names.bType],
           ['select', names.bSelect], ['tpack', names.tPack], ['tunpack', names.tUnpack],
           ['mfloor', names.bMfloor], ['setmeta', names.bSetmeta], ['tostring', names.bTostring],
-          ['dK', dK], ['dC', dC], ['dP', dP],
+          ['dK', dK], ['dC', dC], ['dP', dP], ['dDec', dDec],
         ];
         const wParts = chkVars.map(([l,v]) => `"${l}="..tostring(${v})`);
         parts.push(`warn("[ENV_CHECK] "..${wParts.join('.." "..') })`);
       }
-      parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env})`);
+      parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env},${dDec})`);
     }
 
     output = parts.join("\n");

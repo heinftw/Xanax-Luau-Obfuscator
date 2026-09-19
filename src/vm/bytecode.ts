@@ -185,6 +185,16 @@ export interface RegBytecodeChunk {
   protos?: RegBytecodeChunk[];
 
   upvalues?: [number, number][];
+
+  /**
+   * Per-chunk opcode encode permutation (real op -> stored byte).
+   * Every function prototype gets its own unique opcode alphabet
+   * (per-function opcode isolation): the chunk's instruction stream is
+   * emitted through this map, and the inverse table travels alongside the
+   * serialized proto so the runtime can decode at dispatch time.
+   * undefined = identity permutation.
+   */
+  opcodeMap?: number[];
 }
 
 export function regEmit(chunk: RegBytecodeChunk, op: RegOp, A: number = 0, B: number = 0, C: number = 0): number {

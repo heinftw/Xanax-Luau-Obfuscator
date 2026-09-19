@@ -11,7 +11,9 @@
     "lex": "npm run build && node dist/cli/lex.js",
     "parse": "npm run build && node dist/cli/parse.js",
     "obfuscate": "npm run build && node dist/cli/obfuscate.js",
-    "start": "node dist/cli/lex.js"
+    "start": "node dist/cli/lex.js",
+    "real-check": "node scripts/real_check.mjs",
+    "real-check-quick": "node scripts/real_check.mjs --quick"
   },
   "keywords": [
     "luau",
@@ -26,7 +28,8 @@
     "@types/node": "^20.10.0",
     "jest": "^30.2.0",
     "ts-jest": "^29.4.6",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "wasmoon": "^1.16.0"
   },
   "dependencies": {
     "express": "^5.2.1"
