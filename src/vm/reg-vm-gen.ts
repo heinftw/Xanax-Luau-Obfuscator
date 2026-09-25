@@ -2,7 +2,7 @@ import { RegOp, REG_OPCODE_COUNT, RK_OFFSET } from "./bytecode.js";
 import type { RegBytecodeChunk, Constant } from "./bytecode.js";
 import { randomBytes } from "crypto";
 import { writeFileSync as _dumpWrite } from "fs";
-import { generateBootstrap } from "./bootstrap-template.js";
+import { generateBootstrap, emitSealInstaller, type RuntimeSealSpec } from "./bootstrap-template.js";
 import {
   applyPerProtoOpcodes,
   serializeProtoDecodeTable,
@@ -77,6 +77,13 @@ interface BuildCtx {
   rotStep2: number;
   usedOps?: Set<number>;
   argPerm: number[][];
+  seal?: {
+    spec: RuntimeSealSpec;
+    box: string;
+    slots: Record<string, number>;
+    keyExpr: string;
+  };
+  sealSalt?: number;
 }
 
 interface Fragment {
@@ -231,7 +238,7 @@ function luaStringLiteral(s: string): string {
   for (const b of bytes) {
     if (b === 34) out += '\\"';
     else if (b === 92) out += "\\\\";
-    else if (b === 10) out += "\\n";
+    else if (b === 10) out += "\n";
     else if (b === 13) out += "\\r";
     else if (b === 0) out += "\\000";
     else if (b < 32 || b > 126) out += `\\${b.toString().padStart(3, '0')}`;
@@ -362,8 +369,82 @@ function encodeStringBytes(raw: number[], ctx: BuildCtx, constIdx: number): numb
   }
 
   for (let i = 0; i < b.length; i++) b[i] ^= ((i * ctx.spiralPrime + ctx.spiralOffset + salt) % 251);
+  if (ctx.sealSalt !== undefined) {
+    for (let i = 0; i < b.length; i++) b[i] ^= sealByte(ctx.sealSalt, constIdx, i);
+  }
   return b;
 }
+
+function sealByte(seal: number, constIdx: number, i: number): number {
+  const s0 = seal & 0xff;
+  const s1 = (seal >>> 8) & 0xff;
+  const s2 = (seal >>> 16) & 0xff;
+  const s3 = (seal >>> 24) & 0xff;
+  let x = (s0 + i * 13 + constIdx * 7) & 0xff;
+  x ^= s1;
+  x = (x + s2 + (i & 15) * s3) & 0xff;
+  x ^= (constIdx + i) & 0xff;
+  return x;
+}
+
+const SEAL_BIN: Record<string, number[]> = {
+  add: [43], sub: [45], mul: [42], div: [47], mod: [37], pow: [94],
+  concat: [46, 46], eq: [61, 61], lt: [60], le: [60, 61], gt: [62], ge: [62, 61],
+};
+const SEAL_UNARY: Record<string, number[]> = {
+  unm: [45],
+  not: [110, 111, 116, 32],
+  len: [35],
+};
+const SEAL_BIN_PREFIX = [..."return function(a,b) return a"].map((c) => c.charCodeAt(0));
+const SEAL_BIN_SUFFIX = [..."b end"].map((c) => c.charCodeAt(0));
+const SEAL_UN_PREFIX = [..."return function(a) return "].map((c) => c.charCodeAt(0));
+const SEAL_UN_SUFFIX = [..."a end"].map((c) => c.charCodeAt(0));
+
+function makeRuntimeSeal(): {
+  spec: RuntimeSealSpec;
+  box: string;
+  slots: Record<string, number>;
+  keyExpr: string;
+} {
+  const names = [...Object.keys(SEAL_BIN), ...Object.keys(SEAL_UNARY)];
+  const order = names.map((_, i) => i + 1);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  const slots: Record<string, number> = {};
+  const ops: RuntimeSealSpec["ops"] = [];
+  names.forEach((name, i) => {
+    slots[name] = order[i];
+    const chars = SEAL_BIN[name] ?? SEAL_UNARY[name];
+    const unary = !(name in SEAL_BIN);
+    ops.push({
+      slot: order[i],
+      prefix: unary ? SEAL_UN_PREFIX : SEAL_BIN_PREFIX,
+      stored: chars.slice(),
+      suffix: unary ? SEAL_UN_SUFFIX : SEAL_BIN_SUFFIX,
+    });
+  });
+  const keyCodes: number[] = [];
+  for (let i = 0; i < 8; i++) keyCodes.push(97 + Math.floor(rng() * 26));
+  const keyExpr = `string.char(${keyCodes.map((c) => {
+    const a = Math.floor(rng() * (c + 1));
+    return `(${a}+${c - a})`;
+  }).join(",")})`;
+  let salt = (Math.floor(rng() * 0x100000000) ^ (keyCodes[0] << 16) ^ keyCodes[3]) >>> 0;
+  if (salt === 0) salt = 1;
+  return { spec: { keyCodes, salt, saltSlot: 0, ops }, box: "__bx", slots, keyExpr };
+}
+
+function sealForSource(seal: NonNullable<BuildCtx["seal"]>, vmSource: string): RuntimeSealSpec {
+  const twist = (vmSource.length % 251) + 1;
+  return {
+    ...seal.spec,
+    ops: seal.spec.ops.map((op) => ({ ...op, stored: op.stored.map((c) => c ^ twist) })),
+  };
+}
+
 
 function serializeConstant(v: Constant, ctx: BuildCtx, idx: number): string {
   if (v === null || v === undefined) return "nil";
@@ -517,33 +598,83 @@ registerHandler(RegOp.SETLIST, (n) =>
 registerHandler(RegOp.SELF, (n) =>
   `${n.R}[A+2]=${n.R}[B+1];${n.R}[A+1]=${n.R}[B+1][${n.RK}(C)]`);
 
-registerHandler(RegOp.ADD, (n) => `${n.R}[A+1]=${n.RK}(B)+${n.RK}(C)`);
-registerHandler(RegOp.SUB, (n) => `${n.R}[A+1]=${n.RK}(B)-${n.RK}(C)`);
-registerHandler(RegOp.MUL, (n) => `${n.R}[A+1]=${n.RK}(B)*${n.RK}(C)`);
-registerHandler(RegOp.DIV, (n) => `${n.R}[A+1]=${n.RK}(B)/${n.RK}(C)`);
-registerHandler(RegOp.MOD, (n) => `${n.R}[A+1]=${n.RK}(B)%${n.RK}(C)`);
-registerHandler(RegOp.POW, (n) => `${n.R}[A+1]=${n.RK}(B)^${n.RK}(C)`);
-registerHandler(RegOp.IDIV, (n) => `${n.R}[A+1]=${n.bMfloor}(${n.RK}(B)/${n.RK}(C))`);
+function bx(ctx: BuildCtx, op: string): string | null {
+  if (!ctx.seal) return null;
+  return `${ctx.seal.box}[${ctx.seal.slots[op]}]`;
+}
 
-registerHandler(RegOp.UNM, (n) => `${n.R}[A+1]=-${n.R}[B+1]`);
-registerHandler(RegOp.NOT, (n) => `${n.R}[A+1]=not ${n.R}[B+1]`);
-registerHandler(RegOp.LEN, (n) => `${n.R}[A+1]=#${n.R}[B+1]`);
+registerHandler(RegOp.ADD, (n, ctx) => {
+  const f = bx(ctx, "add");
+  return f ? `${n.R}[A+1]=${f}(${n.RK}(B),${n.RK}(C))` : `${n.R}[A+1]=${n.RK}(B)+${n.RK}(C)`;
+});
+registerHandler(RegOp.SUB, (n, ctx) => {
+  const f = bx(ctx, "sub");
+  return f ? `${n.R}[A+1]=${f}(${n.RK}(B),${n.RK}(C))` : `${n.R}[A+1]=${n.RK}(B)-${n.RK}(C)`;
+});
+registerHandler(RegOp.MUL, (n, ctx) => {
+  const f = bx(ctx, "mul");
+  return f ? `${n.R}[A+1]=${f}(${n.RK}(B),${n.RK}(C))` : `${n.R}[A+1]=${n.RK}(B)*${n.RK}(C)`;
+});
+registerHandler(RegOp.DIV, (n, ctx) => {
+  const f = bx(ctx, "div");
+  return f ? `${n.R}[A+1]=${f}(${n.RK}(B),${n.RK}(C))` : `${n.R}[A+1]=${n.RK}(B)/${n.RK}(C)`;
+});
+registerHandler(RegOp.MOD, (n, ctx) => {
+  const f = bx(ctx, "mod");
+  return f ? `${n.R}[A+1]=${f}(${n.RK}(B),${n.RK}(C))` : `${n.R}[A+1]=${n.RK}(B)%${n.RK}(C)`;
+});
+registerHandler(RegOp.POW, (n, ctx) => {
+  const f = bx(ctx, "pow");
+  return f ? `${n.R}[A+1]=${f}(${n.RK}(B),${n.RK}(C))` : `${n.R}[A+1]=${n.RK}(B)^${n.RK}(C)`;
+});
+registerHandler(RegOp.IDIV, (n, ctx) => {
+  const f = bx(ctx, "div");
+  return f ? `${n.R}[A+1]=${n.bMfloor}(${f}(${n.RK}(B),${n.RK}(C)))` : `${n.R}[A+1]=${n.bMfloor}(${n.RK}(B)/${n.RK}(C))`;
+});
 
-registerHandler(RegOp.CONCAT, (n) =>
-  `do if C-B<=1 then ${n.R}[A+1]=${n.R}[B+1]..${n.R}[C+1] ` +
-  `else local _t={};for _i=B,C do _t[#_t+1]=${n.R}[_i+1] end;${n.R}[A+1]=${n.bTconcat}(_t) end end`);
+registerHandler(RegOp.UNM, (n, ctx) => {
+  const f = bx(ctx, "unm");
+  return f ? `${n.R}[A+1]=${f}(${n.R}[B+1])` : `${n.R}[A+1]=-${n.R}[B+1]`;
+});
+registerHandler(RegOp.NOT, (n, ctx) => {
+  const f = bx(ctx, "not");
+  return f ? `${n.R}[A+1]=${f}(${n.R}[B+1])` : `${n.R}[A+1]=not ${n.R}[B+1]`;
+});
+registerHandler(RegOp.LEN, (n, ctx) => {
+  const f = bx(ctx, "len");
+  return f ? `${n.R}[A+1]=${f}(${n.R}[B+1])` : `${n.R}[A+1]=#${n.R}[B+1]`;
+});
+
+registerHandler(RegOp.CONCAT, (n, ctx) => {
+  const f = bx(ctx, "concat");
+  if (!f) {
+    return `do if C-B<=1 then ${n.R}[A+1]=${n.R}[B+1]..${n.R}[C+1] ` +
+      `else local _t={};for _i=B,C do _t[#_t+1]=${n.R}[_i+1] end;${n.R}[A+1]=${n.bTconcat}(_t) end end`;
+  }
+  return `do if C-B<=1 then ${n.R}[A+1]=${f}(${n.R}[B+1],${n.R}[C+1]) ` +
+    `else local _t={};for _i=B,C do _t[#_t+1]=${n.R}[_i+1] end;${n.R}[A+1]=${n.bTconcat}(_t) end end`;
+});
 
 registerHandler(RegOp.JMP, (n) =>
   `${n.ip}=${n.ip}+B*4`);
 
-registerHandler(RegOp.EQ, (n) =>
-  `if (${n.RK}(B)==${n.RK}(C))~=(A~=0) then ${n.ip}=${n.ip}+4 end`);
+registerHandler(RegOp.EQ, (n, ctx) => {
+  const f = bx(ctx, "eq");
+  const cmp = f ? `${f}(${n.RK}(B),${n.RK}(C))` : `(${n.RK}(B)==${n.RK}(C))`;
+  return `if ${cmp}~=(A~=0) then ${n.ip}=${n.ip}+4 end`;
+});
 
-registerHandler(RegOp.LT, (n) =>
-  `if (${n.RK}(B)<${n.RK}(C))~=(A~=0) then ${n.ip}=${n.ip}+4 end`);
+registerHandler(RegOp.LT, (n, ctx) => {
+  const f = bx(ctx, "lt");
+  const cmp = f ? `${f}(${n.RK}(B),${n.RK}(C))` : `(${n.RK}(B)<${n.RK}(C))`;
+  return `if ${cmp}~=(A~=0) then ${n.ip}=${n.ip}+4 end`;
+});
 
-registerHandler(RegOp.LE, (n) =>
-  `if (${n.RK}(B)<=${n.RK}(C))~=(A~=0) then ${n.ip}=${n.ip}+4 end`);
+registerHandler(RegOp.LE, (n, ctx) => {
+  const f = bx(ctx, "le");
+  const cmp = f ? `${f}(${n.RK}(B),${n.RK}(C))` : `(${n.RK}(B)<=${n.RK}(C))`;
+  return `if ${cmp}~=(A~=0) then ${n.ip}=${n.ip}+4 end`;
+});
 
 registerHandler(RegOp.TEST, (n) =>
   `if (not ${n.R}[A+1])==(C~=0) then ${n.ip}=${n.ip}+4 end`);
@@ -578,13 +709,27 @@ registerHandler(RegOp.RETURN, (n) =>
   `elseif B==1 then return ` +
   `else return ${n.tUnpack}(${n.R},A+1,A+B-1) end end`);
 
-registerHandler(RegOp.FORPREP, (n) =>
-  `${n.R}[A+1]=${n.R}[A+1]-${n.R}[A+3];${n.ip}=${n.ip}+B*4`);
+registerHandler(RegOp.FORPREP, (n, ctx) => {
+  const f = bx(ctx, "sub");
+  return f
+    ? `${n.R}[A+1]=${f}(${n.R}[A+1],${n.R}[A+3]);${n.ip}=${n.ip}+B*4`
+    : `${n.R}[A+1]=${n.R}[A+1]-${n.R}[A+3];${n.ip}=${n.ip}+B*4`;
+});
 
-registerHandler(RegOp.FORLOOP, (n) =>
-  `do local step=${n.R}[A+3];local idx=${n.R}[A+1]+step;${n.R}[A+1]=idx;` +
-  `local lim=${n.R}[A+2];if step>0 then if idx<=lim then ${n.ip}=${n.ip}+B*4;${n.R}[A+4]=idx end ` +
-  `else if idx>=lim then ${n.ip}=${n.ip}+B*4;${n.R}[A+4]=idx end end end`);
+registerHandler(RegOp.FORLOOP, (n, ctx) => {
+  const add = bx(ctx, "add");
+  const gt = bx(ctx, "gt");
+  const le = bx(ctx, "le");
+  const ge = bx(ctx, "ge");
+  if (!add || !gt || !le || !ge) {
+    return `do local step=${n.R}[A+3];local idx=${n.R}[A+1]+step;${n.R}[A+1]=idx;` +
+      `local lim=${n.R}[A+2];if step>0 then if idx<=lim then ${n.ip}=${n.ip}+B*4;${n.R}[A+4]=idx end ` +
+      `else if idx>=lim then ${n.ip}=${n.ip}+B*4;${n.R}[A+4]=idx end end end`;
+  }
+  return `do local step=${n.R}[A+3];local idx=${add}(${n.R}[A+1],step);${n.R}[A+1]=idx;` +
+    `local lim=${n.R}[A+2];if ${gt}(step,0) then if ${le}(idx,lim) then ${n.ip}=${n.ip}+B*4;${n.R}[A+4]=idx end ` +
+    `else if ${ge}(idx,lim) then ${n.ip}=${n.ip}+B*4;${n.R}[A+4]=idx end end end`;
+});
 
 registerHandler(RegOp.TFORLOOP, (n) =>
   `do local f=${n.R}[A+1];local s=${n.R}[A+2];local v=${n.R}[A+3];` +
@@ -658,31 +803,40 @@ registerHandler(RegOp.FUSED_TEST_JMP, (n) => {
   return `do local _o=${n.code}[${n.ip}+2]*4;${n.ip}=${n.ip}+4;if (not ${n.R}[A+1])~=(C~=0) then ${n.ip}=${n.ip}+_o end end`;
 });
 
-registerHandler(RegOp.FUSED_EQ_JMP, (n) => {
+registerHandler(RegOp.FUSED_EQ_JMP, (n, ctx) => {
+  const f = bx(ctx, "eq");
+  const cmp = f ? `${f}(${n.RK}(B),${n.RK}(C))` : `(${n.RK}(B)==${n.RK}(C))`;
   const v = Math.floor(rng() * 3);
   if (v === 0)
-    return `do local _j=${n.code}[${n.ip}+2];if (${n.RK}(B)==${n.RK}(C))~=(A~=0) then ${n.ip}=${n.ip}+4 else ${n.ip}=${n.ip}+4+_j*4 end end`;
+    return `do local _j=${n.code}[${n.ip}+2];if ${cmp}~=(A~=0) then ${n.ip}=${n.ip}+4 else ${n.ip}=${n.ip}+4+_j*4 end end`;
   if (v === 1)
-    return `do local _j=${n.code}[${n.ip}+2];if (${n.RK}(B)==${n.RK}(C))==(A~=0) then ${n.ip}=${n.ip}+4+_j*4 else ${n.ip}=${n.ip}+4 end end`;
-  return `do local _lv,_rv=${n.RK}(B),${n.RK}(C);local _j=${n.code}[${n.ip}+2];if (_lv==_rv)~=(A~=0) then ${n.ip}=${n.ip}+4 else ${n.ip}=${n.ip}+4+_j*4 end end`;
+    return `do local _j=${n.code}[${n.ip}+2];if ${cmp}==(A~=0) then ${n.ip}=${n.ip}+4+_j*4 else ${n.ip}=${n.ip}+4 end end`;
+  const pair = f ? `${f}(_lv,_rv)` : `(_lv==_rv)`;
+  return `do local _lv,_rv=${n.RK}(B),${n.RK}(C);local _j=${n.code}[${n.ip}+2];if ${pair}~=(A~=0) then ${n.ip}=${n.ip}+4 else ${n.ip}=${n.ip}+4+_j*4 end end`;
 });
 
-registerHandler(RegOp.FUSED_LT_JMP, (n) => {
+registerHandler(RegOp.FUSED_LT_JMP, (n, ctx) => {
+  const f = bx(ctx, "lt");
+  const cmp = f ? `${f}(${n.RK}(B),${n.RK}(C))` : `(${n.RK}(B)<${n.RK}(C))`;
   const v = Math.floor(rng() * 3);
   if (v === 0)
-    return `do local _j=${n.code}[${n.ip}+2];if (${n.RK}(B)<${n.RK}(C))~=(A~=0) then ${n.ip}=${n.ip}+4 else ${n.ip}=${n.ip}+4+_j*4 end end`;
+    return `do local _j=${n.code}[${n.ip}+2];if ${cmp}~=(A~=0) then ${n.ip}=${n.ip}+4 else ${n.ip}=${n.ip}+4+_j*4 end end`;
   if (v === 1)
-    return `do local _j=${n.code}[${n.ip}+2];if (${n.RK}(B)<${n.RK}(C))==(A~=0) then ${n.ip}=${n.ip}+4+_j*4 else ${n.ip}=${n.ip}+4 end end`;
-  return `do local _lv,_rv=${n.RK}(B),${n.RK}(C);local _o=${n.code}[${n.ip}+2]*4;${n.ip}=${n.ip}+4;if (_lv<_rv)==(A~=0) then ${n.ip}=${n.ip}+_o end end`;
+    return `do local _j=${n.code}[${n.ip}+2];if ${cmp}==(A~=0) then ${n.ip}=${n.ip}+4+_j*4 else ${n.ip}=${n.ip}+4 end end`;
+  const pair = f ? `${f}(_lv,_rv)` : `(_lv<_rv)`;
+  return `do local _lv,_rv=${n.RK}(B),${n.RK}(C);local _o=${n.code}[${n.ip}+2]*4;${n.ip}=${n.ip}+4;if ${pair}==(A~=0) then ${n.ip}=${n.ip}+_o end end`;
 });
 
-registerHandler(RegOp.FUSED_LE_JMP, (n) => {
+registerHandler(RegOp.FUSED_LE_JMP, (n, ctx) => {
+  const f = bx(ctx, "le");
+  const cmp = f ? `${f}(${n.RK}(B),${n.RK}(C))` : `(${n.RK}(B)<=${n.RK}(C))`;
   const v = Math.floor(rng() * 3);
   if (v === 0)
-    return `do local _j=${n.code}[${n.ip}+2];if (${n.RK}(B)<=${n.RK}(C))~=(A~=0) then ${n.ip}=${n.ip}+4 else ${n.ip}=${n.ip}+4+_j*4 end end`;
+    return `do local _j=${n.code}[${n.ip}+2];if ${cmp}~=(A~=0) then ${n.ip}=${n.ip}+4 else ${n.ip}=${n.ip}+4+_j*4 end end`;
   if (v === 1)
-    return `do local _j=${n.code}[${n.ip}+2];if (${n.RK}(B)<=${n.RK}(C))==(A~=0) then ${n.ip}=${n.ip}+4+_j*4 else ${n.ip}=${n.ip}+4 end end`;
-  return `do local _lv,_rv=${n.RK}(B),${n.RK}(C);local _o=${n.code}[${n.ip}+2]*4;${n.ip}=${n.ip}+4;if (_lv<=_rv)==(A~=0) then ${n.ip}=${n.ip}+_o end end`;
+    return `do local _j=${n.code}[${n.ip}+2];if ${cmp}==(A~=0) then ${n.ip}=${n.ip}+4+_j*4 else ${n.ip}=${n.ip}+4 end end`;
+  const pair = f ? `${f}(_lv,_rv)` : `(_lv<=_rv)`;
+  return `do local _lv,_rv=${n.RK}(B),${n.RK}(C);local _o=${n.code}[${n.ip}+2]*4;${n.ip}=${n.ip}+4;if ${pair}==(A~=0) then ${n.ip}=${n.ip}+_o end end`;
 });
 
 registerHandler(RegOp.FUSED_TESTSET_JMP, (n) => {
@@ -1314,6 +1468,7 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
   L.push(`${n.upvalues}=${n.upvalues} or {}`);
   // STEP 1: per-proto decode table - _decodeTbl is the table for THIS function
   L.push(`local __dt=_decodeTbl or nil`);
+  if (ctx.seal) L.push(`local ${ctx.seal.box}=rawget(_G,${ctx.seal.keyExpr})`);
 
   L.push(`local ${n.R}=${n.bTcreate}(${n.maxRegs}+1)`);
 
@@ -1967,6 +2122,7 @@ function buildDecoderChain(
   const forwardDecls: string[] = [];
 
   const nPre = randomName(6);
+  const nSeal = randomName(6);
   const n5 = randomName(6);
   const n4 = randomName(6);
   const n3 = randomName(6);
@@ -1975,7 +2131,14 @@ function buildDecoderChain(
   const nF = randomName(6);
   const nAll = randomName(6);
   const nProtos = randomName(6);
-  forwardDecls.push(nPre, n5, n4, n3, n2, n1, nF, nAll, nProtos);
+  forwardDecls.push(nPre, nSeal, n5, n4, n3, n2, n1, nF, nAll, nProtos);
+  if (ctx.seal && ctx.encodeStrings) {
+    const key = ctx.seal.keyExpr;
+    const slot = ctx.seal.spec.saltSlot;
+    fragments.push({ code: `${nSeal}=function(_0K) local _bx=rawget(_G,${key});if type(_bx)~="table" then return end;local _s=_bx[${slot}];local _s0=bit32.band(_s,255);local _s1=bit32.band(bit32.rshift(_s,8),255);local _s2=bit32.band(bit32.rshift(_s,16),255);local _s3=bit32.band(bit32.rshift(_s,24),255);for _0i,_0v in ipairs(_0K) do if type(_0v)=="table" then local _ci=_0i-1;for _0j=1,#_0v do local _i=_0j-1;local _x=bit32.band(_s0+_i*13+_ci*7,255);_x=bit32.bxor(_x,_s1);_x=bit32.band(_x+_s2+bit32.band(_i,15)*_s3,255);_x=bit32.bxor(_x,bit32.band(_ci+_i,255));_0v[_0j]=bit32.bxor(_0v[_0j],_x) end end end end`, layer: 0 });
+  } else {
+    fragments.push({ code: `${nSeal}=function() end`, layer: 0 });
+  }
 
   const wrapA = (name: string, inner: string) =>
     `${name}=function(_0K) for _0i,_0v in ipairs(_0K) do if type(_0v)=="table" then ${inner} end end end`;
@@ -2086,7 +2249,7 @@ function buildDecoderChain(
     const tblName = randomName(4);
     const ordName = randomName(4);
     forwardDecls.push(tblName, ordName);
-    const realFns = [n5, n4, n3, n2, n1, nF];
+    const realFns = [nSeal, n5, n4, n3, n2, n1, nF];
 
     const allIndices: number[] = [];
     for (let i = 1; i <= realFns.length; i++) allIndices.push(i);
@@ -2108,10 +2271,11 @@ function buildDecoderChain(
     fragments.push({ code: `${nAll}=function(_0K) for _0oi=1,#${ordName} do ${tblName}[${ordName}[_0oi]](_0K) end end`, layer: 3 });
   } else if (chainVariant === 1) {
 
-    const realFns = [n5, n4, n3, n2, n1, nF];
+    const realFns = [nSeal, n5, n4, n3, n2, n1, nF];
     const predicates = [
       `type("")=="string"`, `type(1)=="number"`, `select("#",1)==1`,
       `type({})=="table"`, `type(true)=="boolean"`, `1+1==2`,
+      `type(nil)=="nil"`,
     ];
     const predOrder = [...predicates];
     for (let i = predOrder.length - 1; i > 0; i--) {
@@ -2125,7 +2289,7 @@ function buildDecoderChain(
     fragments.push({ code: `${nAll}=function(_0K) ${bodyParts.join(";")} end`, layer: 3 });
   } else {
 
-    const realFns = [n5, n4, n3, n2, n1, nF];
+    const realFns = [nSeal, n5, n4, n3, n2, n1, nF];
     fragments.push({ code: `${nAll}=function(_0K) ${realFns.map(fn => `${fn}(_0K)`).join(";")} end`, layer: 3 });
   }
 
@@ -3395,7 +3559,9 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
     spiralPrime, spiralOffset, layerVariants,
     dispatchVariant, dispatchMask, rotSeed, rotStep, rotStep2,
     argPerm: generateArgPerms(isObf),
+    ...(isObf ? { seal: makeRuntimeSeal() } : {}),
   };
+  if (ctx.seal) ctx.sealSalt = ctx.seal.spec.salt;
 
   const doFusion = featureEnabled(options, "opcodeFusion", level !== "debug");
   if (doFusion) {
@@ -3594,7 +3760,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
           fc = `local ${jn}={};for _k=1,${8+Math.floor(rng()*24)} do ${jn}[_k]=bit32.band(bit32.bxor(_k*${1+Math.floor(rng()*7)},${Math.floor(rng()*256)}),0xFF) end;local ${jn2}=${jn}[1];for _k=2,#${jn} do ${jn2}=2*bit32.band(${jn2},${jn}[_k])+bit32.bxor(${jn2},${jn}[_k]) end`;
         } else if (fv === 5) {
 
-          fc = `local ${jn}=2*bit32.band(${fa},${fb})+bit32.bxor(${fa},${fb});local ${jn2}=bit32.bxor(bit32.bxor(${jn},${Math.floor(rng()*65536)}),${Math.floor(rng()*65536)})`;
+          fc = `local ${jn}=2*bit32.band(${fa},${fb})+bit32.bxor(${fa},${fb});local ${jn2}=bit32.band(${jn},0xFFFFFFFF)`;
         } else if (fv === 6) {
 
           fc = `local ${jn}={${Array.from({length:6+Math.floor(rng()*10)},()=>Math.floor(rng()*256)).join(",")}};local ${jn2}="";for _k=1,#${jn} do ${jn2}=${jn2}..string.char(bit32.band(bit32.bxor(${jn}[_k],_k*${1+Math.floor(rng()*13)}+${Math.floor(rng()*200)}),0x7F)+32) end`;
@@ -3625,10 +3791,10 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
         } else if (tVar === 2) {
 
           const mask = 1 + Math.floor(rng() * 65535);
-          return `${cffSt}=bit32.bxor(bit32.bxor(${target},${mask}),${mask})`;
+          return `${cffSt}=(${target}+${mask})-${mask}`;
         } else if (tVar === 3) {
 
-          return `${cffSt}=bit32.bxor(bit32.bxor(${target},0xFFFFFFFF),0xFFFFFFFF)`;
+          return `${cffSt}=(${target}+0)-0`;
         } else if (tVar === 4) {
 
           const mul = 3 + Math.floor(rng() * 13);
@@ -3638,7 +3804,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
           const xa = Math.floor(rng() * 65536);
           const xb = Math.floor(rng() * 65536);
           const encoded = target ^ xa ^ xb;
-          return `${cffSt}=bit32.bxor(bit32.bxor(${encoded},${xb}),${xa})`;
+          return `${cffSt}=bit32.bxor(${encoded},bit32.bxor(${xa},${xb}))`;
         }
       };
 
@@ -3698,6 +3864,11 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
     console.log(`[RegVM] DUMP_RAW: saved ${output.length} chars to debug-vm-raw.lua`);
   }
 
+  if (level !== "debug" && process.env.NO_CIPHER === '1' && ctx.seal) {
+    const spec = sealForSource(ctx.seal, output);
+    output = emitSealInstaller(spec, String(output.length), "_sealKey", rng) + "\n" + output;
+  }
+
   if (level !== "debug" && process.env.NO_CIPHER !== '1') {
     const vmRawLen = Buffer.byteLength(output, 'utf-8');
     console.log(`[RegVM] Blob: packing VM runtime (${vmRawLen} bytes) through deser pipeline...`);
@@ -3705,6 +3876,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
       vmSource: output,
       chunkName: "Xanax",
       rng,
+      runtimeSeal: ctx.seal ? sealForSource(ctx.seal, output) : undefined,
     });
     console.log(`[RegVM] Blob: final output = ${output.length} chars (decode→decrypt→inflate→deser→transform→load)`);
   }

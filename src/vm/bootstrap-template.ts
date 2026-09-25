@@ -17,11 +17,25 @@
  *   C  rolling-key XOR only: key = key*31+7 mod 256, never a single constant
  */
 
+/**
+ * Operators and the string-seal live outside the loadstring image.
+ * A dump of the loaded chunk therefore has ciphertext and indirect calls,
+ * not `*` / `..` and not the plaintext constants.
+ */
+export interface RuntimeSealSpec {
+  keyCodes: number[];
+  salt: number;
+  saltSlot: number;
+  /** Each stored char is XOR'd with ((vmSource.length % 251) + 1) at runtime. */
+  ops: { slot: number; prefix: number[]; stored: number[]; suffix: number[] }[];
+}
+
 export interface BootstrapConfig {
   /** Raw VM source that loadstring must receive after reconstruction. */
   vmSource: string;
   chunkName?: string;
   rng: () => number;
+  runtimeSeal?: RuntimeSealSpec;
 }
 
 const BANNED_SUBSTRINGS = ["52200625", "65521", "32640", "rep(5)", "bit32.bxor(bit32.bxor"];
@@ -622,6 +636,26 @@ function charList(codes: number[], nChar: string, rng: () => number): string {
   return `${nChar}(${codes.map((c) => obfuscateNum(c, rng)).join(",")})`;
 }
 
+/** Install the external op table. `lenExpr` must evaluate to #vmSource. */
+export function emitSealInstaller(seal: RuntimeSealSpec, lenExpr: string, keyVar: string, rng: () => number): string {
+  const ch = (codes: number[]) => `string.char(${codes.map((c) => obfuscateNum(c, rng)).join(",")})`;
+  const s0 = seal.salt & 0xff;
+  const s1 = (seal.salt >>> 8) & 0xff;
+  const s2 = (seal.salt >>> 16) & 0xff;
+  const s3 = (seal.salt >>> 24) & 0xff;
+  const L: string[] = [];
+  L.push(`local ${keyVar}=${ch(seal.keyCodes)}`);
+  L.push(`local _tw=${lenExpr}%251+1`);
+  L.push(`local _b={}`);
+  L.push(`_b[${seal.saltSlot}]=bit32.bor(${obfuscateNum(s0, rng)},bit32.lshift(${obfuscateNum(s1, rng)},8),bit32.lshift(${obfuscateNum(s2, rng)},16),bit32.lshift(${obfuscateNum(s3, rng)},24))`);
+  for (const op of seal.ops) {
+    const stored = op.stored.map((c) => `bit32.bxor(${obfuscateNum(c, rng)},_tw)`).join(",");
+    L.push(`_b[${op.slot}]=loadstring(${ch(op.prefix)}..string.char(${stored})..${ch(op.suffix)})()`);
+  }
+  L.push(`rawset(_G,${keyVar},_b)`);
+  return L.join("\n");
+}
+
 export function generateBootstrap(config: BootstrapConfig): string {
   const { vmSource, chunkName = "Xanax", rng } = config;
   if (typeof vmSource !== "string") {
@@ -1146,6 +1180,16 @@ export function generateBootstrap(config: BootstrapConfig): string {
   push(`end`);
 
   push(`${nSlots}[${slotExpr(tokLoad)}]=function()`);
+  push(`do`);
+  push(`local _dg=${nRawget}(_G,${nChar}(${[100, 101, 98, 117, 103].map((c) => obfuscateNum(c, rng)).join(",")}))`);
+  push(`if ${nType}(_dg)==\"table\" then`);
+  push(`local _inf=_dg[${nChar}(${[105, 110, 102, 111].map((c) => obfuscateNum(c, rng)).join(",")})]`);
+  push(`if ${nType}(_inf)==\"function\" then`);
+  push(`local _ss=_inf(loadstring,${nChar}(${obfuscateNum(115, rng)}))`);
+  push(`if ${nType}(_ss)==\"string\" and _ss~=${nChar}(${[91, 67, 93].map((c) => obfuscateNum(c, rng)).join(",")}) then ${nIntact}=false end`);
+  push(`end`);
+  push(`end`);
+  push(`end`);
   push(`${nTwist}=0`);
   push(`if not ${nIntact} then ${nTwist}=1 end`);
   push(`if 2*${nOpaA}+${nOpaB}+${nTwist}==${opaExpected} then`);
@@ -1161,7 +1205,14 @@ export function generateBootstrap(config: BootstrapConfig): string {
   push(`${nWipe}()`);
   push(`${nAssert}(false,${nMsg})`);
   push(`end`);
-  push(`local packed={${nPcall}(${nFn},unpack(_va,1,_vn))}`);
+  if (config.runtimeSeal) {
+    const keyVar = N();
+    push(emitSealInstaller(config.runtimeSeal, `#${nSrc}`, keyVar, rng));
+    push(`local packed={${nPcall}(${nFn},unpack(_va,1,_vn))}`);
+    push(`rawset(_G,${keyVar},nil)`);
+  } else {
+    push(`local packed={${nPcall}(${nFn},unpack(_va,1,_vn))}`);
+  }
   push(`${nWipe}()`);
   push(`if not packed[1] then error(packed[2]) end`);
   push(`return unpack(packed,2)`);
