@@ -3655,7 +3655,7 @@ export function generateVM(chunk: BytecodeChunk, options: VMGenOptions = {}): st
       `  \\___|_|\\_, \\__,_\\___| |_| |_| \\___/\\__\\___\\__|\\__|_\\___/_||_|   \\_/ |_|`,
       `         |__/`,
       ``,
-      `  https://clydeprotectionde.cloud`,
+      `  https://xanax-obfuscator.github.io`,
       `  build ${fpHex}`,
     ];
 

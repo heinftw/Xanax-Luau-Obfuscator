@@ -4,6 +4,11 @@ import { randomBytes } from "crypto";
 import { writeFileSync as _dumpWrite } from "fs";
 import { encryptAndEncode, compressToBase85, compressBytesToBase85 } from "./lzma.js";
 import { generateBootstrap } from "./bootstrap-template.js";
+import {
+  applyPerProtoOpcodes,
+  serializeProtoDecodeTable,
+  verifyPerProtoIsolation,
+} from "./RegVMUpgrade.js";
 
 export type RegVMLevel = "debug" | "normal" | "max";
 
@@ -424,7 +429,9 @@ function serializeRegProtos(protos: RegBytecodeChunk[] | undefined, ctx: BuildCt
   const usePositional = ctx.level !== "debug";
   const items: string[] = [];
   for (const p of protos) {
-    const mappedCode = ctx.doShuffle ? mapRegBytecode(p.code, ctx.opcodeEncode, ctx.argPerm) : p.code;
+    // STEP 1: use THIS proto's own encode table, not the global one
+    const protoEncode = p.opEncode ?? ctx.opcodeEncode;
+    const mappedCode = ctx.doShuffle ? mapRegBytecode(p.code, protoEncode, ctx.argPerm) : p.code;
     const sK = serializeConstants(p.K, ctx);
     const sC = serializeRegCode(mappedCode, ctx);
     const sP = serializeRegProtos(p.protos, ctx);
@@ -435,11 +442,11 @@ function serializeRegProtos(protos: RegBytecodeChunk[] | undefined, ctx: BuildCt
     const nP = p.nParams ?? 0;
     const mR = p.maxRegs ?? 0;
     const isVA = p.isVararg ? "true" : "false";
+    const dT = serializeProtoDecodeTable(p, rng);
     if (usePositional) {
-
-      items.push(`{${sK},${sC},${sP},${sU},${nP},${mR},${isVA}}`);
+      items.push(`{${sK},${sC},${sP},${sU},${nP},${mR},${isVA},${dT}}`);
     } else {
-      items.push(`{${pk.pK}=${sK},${pk.pC}=${sC},${pk.pP}=${sP},${pk.pU}=${sU},${pk.pN}=${nP},mR=${mR},vA=${isVA}}`);
+      items.push(`{${pk.pK}=${sK},${pk.pC}=${sC},${pk.pP}=${sP},${pk.pU}=${sU},${pk.pN}=${nP},mR=${mR},vA=${isVA},dT=${dT}}`);
     }
   }
   return `{${items.join(",")}}`;
@@ -616,12 +623,13 @@ registerHandler(RegOp.CLOSURE, (n, ctx) => {
   const gN = pos ? "[5]" : `.${pN}`;
   const gMR = pos ? "[6]" : ".mR";
   const gVA = pos ? "[7]" : ".vA";
+  const gDT = pos ? "[8]" : ".dT";
   return `do local proto=${n.protos}[B+1];if proto then ` +
     `local nU={};if proto${gU} then for _ui,_ud in ${n.bIpairs}(proto${gU}) do ` +
     `if _ud[1]==1 then local _b;for _oi=1,#${n.openUVs} do if ${n.openUVs}[_oi][2]==_ud[2]+1 then _b=${n.openUVs}[_oi];break end end;` +
     `if not _b then _b={${n.R},_ud[2]+1};${n.openUVs}[#${n.openUVs}+1]=_b end;nU[_ui]=_b ` +
     `else nU[_ui]=${n.upvalues}[_ud[2]+1] end end end;` +
-    `${n.R}[A+1]=function(...) return ${n.run}(proto${gK},proto${gC},proto${gP},proto${gU} and nU or {},proto${gN},proto${gMR},proto${gVA},${n.env},...) end ` +
+    `${n.R}[A+1]=function(...) return ${n.run}(proto${gK},proto${gC},proto${gP},proto${gU} and nU or {},proto${gN},proto${gMR},proto${gVA},${n.env},proto${gDT} or nil,...) end ` +
     `else ${n.R}[A+1]=nil end end`;
 });
 
@@ -1300,10 +1308,12 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
   const L: string[] = [];
 
   L.push(assignStyle
-    ? `${n.run}=function(${n.K},${n.code},${n.protos},${n.upvalues},${n.nParams},${n.maxRegs},_isVararg,${n.env},...)`
-    : `local function ${n.run}(${n.K},${n.code},${n.protos},${n.upvalues},${n.nParams},${n.maxRegs},_isVararg,${n.env},...)`);
+    ? `${n.run}=function(${n.K},${n.code},${n.protos},${n.upvalues},${n.nParams},${n.maxRegs},_isVararg,${n.env},_decodeTbl,...)`
+    : `local function ${n.run}(${n.K},${n.code},${n.protos},${n.upvalues},${n.nParams},${n.maxRegs},_isVararg,${n.env},_decodeTbl,...)`);
   L.push(`${n.protos}=${n.protos} or {}`);
   L.push(`${n.upvalues}=${n.upvalues} or {}`);
+  // STEP 1: per-proto decode table - _decodeTbl is the table for THIS function
+  L.push(`local _D=_decodeTbl or nil`);
 
   L.push(`local ${n.R}=${n.bTcreate}(${n.maxRegs}+1)`);
 
@@ -1510,6 +1520,8 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
       L.push(`local ${opVar}=${n.bBxor}(${n.code}[${n.ip}],${mkVar})`);
     }
 
+    // STEP 1: decode wire opcode through per-function decode table
+    L.push(`if _D then ${opVar}=_D[${opVar}+1]-1 or ${opVar} end`);
     L.push(`local ${n.s1}=${n.code}[${n.ip}+1]`);
     L.push(`local ${n.s2}=${n.code}[${n.ip}+2]`);
     L.push(`local ${n.s3}=${n.code}[${n.ip}+3]`);
@@ -1529,6 +1541,8 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
     } else {
       L.push(`local ${opVar}=${n.code}[${n.ip}]`);
     }
+    // STEP 1: decode wire opcode through per-function decode table
+    L.push(`if _D then ${opVar}=_D[${opVar}+1]-1 or ${opVar} end`);
     L.push(`local ${n.s1}=${n.code}[${n.ip}+1]`);
     L.push(`local ${n.s2}=${n.code}[${n.ip}+2]`);
     L.push(`local ${n.s3}=${n.code}[${n.ip}+3]`);
@@ -3110,7 +3124,9 @@ function wrapCustomCipher(source: string, layerOpts?: CipherLayerOpts): string {
     secL.push(`${nGuard}=true`);
   }
   const cShuffle = randomName(2);
-  secL.push(`if not ${nGuard} then local ${cShuffle}=#${nOut};for _i=${cShuffle},2,-1 do local _j=1+(_i*${corruptKey}+${Math.floor(rng() * 65536)})%_i;${nOut}[_i],${nOut}[_j]=${nOut}[_j],${nOut}[_i] end;for _i=${nBand}(${cShuffle},${Math.floor(rng() * 128) + 128})+1,${cShuffle} do ${nOut}[_i]=nil end end`);
+  const cM = randomName(2);
+  secL.push(`local ${cM}=1-((${nGuard}==true)and 1 or 0)`);
+  secL.push(`do local ${cShuffle}=#${nOut}*${cM};for _i=${cShuffle},2,-1 do local _j=1+(_i*${corruptKey}+${Math.floor(rng() * 65536)})%_i;${nOut}[_i],${nOut}[_j]=${nOut}[_j],${nOut}[_i] end;for _i=${nBand}(${cShuffle},${Math.floor(rng() * 128) + 128})+1,${cShuffle} do ${nOut}[_i]=nil end end`);
   if (layerOpts) {
     secL.push(`if not ${nGuard} then ${nRawSet}(${nEv},${nCh}(${ccArgs(layerOpts.signalKey, true)}),${Math.floor(rng() * 65536)}) end`);
   }
@@ -3134,7 +3150,9 @@ function wrapCustomCipher(source: string, layerOpts?: CipherLayerOpts): string {
   execL.push(`do local ${adOk},${adFn}=${nCPcall}(${nLd},${nCh}(${ccArgs("return 0", true)}));${adProbe}=${adProbe} and ${adOk}==true and ${nCType}(${adFn})==${nCh}(${ccArgs("function", true)}) end`);
 
   if (process.env.NO_SEC !== '1') {
-    execL.push(`if not ${adProbe} then for _i=1,#${nOut} do ${nOut}[_i]=${nCh}(${Math.floor(rng() * 94) + 33}) end end`);
+    const adM = randomName(2);
+    execL.push(`local ${adM}=1-((${adProbe}==true)and 1 or 0)`);
+    execL.push(`for _i=1,#${nOut}*${adM} do ${nOut}[_i]=${nCh}(${Math.floor(rng() * 94) + 33}) end`);
   } else {
 
     rng();
@@ -3328,6 +3346,13 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
 
   const { encode, decode } = shuffleOpcodes(doShuffle);
 
+  // STEP 1: per-function opcode isolation
+  const perProtoRefs = applyPerProtoOpcodes(chunk, seed, doShuffle);
+  {
+    const v = verifyPerProtoIsolation(chunk);
+    console.log(`[RegVM] Per-proto opcodes: ${v.protos} protos, ${v.uniqueTables} unique tables - ${v.reason}`);
+  }
+
   const protoKeys = level === "max" ? {
     pK: randomName(2), pC: randomName(2), pP: randomName(2),
     pU: randomName(2), pN: randomName(2),
@@ -3417,7 +3442,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
   const dvNames = ["flat","xor-masked","binary-tree","grouped","table-dispatch","table-xor"];
   if (level !== "debug") console.log(`[RegVM] Dispatch: variant ${dispatchVariant} (${dvNames[dispatchVariant] || "unknown"})`);
 
-  const mappedCode = doShuffle ? mapRegBytecode(chunk.code, encode, ctx.argPerm) : chunk.code;
+  const mappedCode = doShuffle ? mapRegBytecode(chunk.code, chunk.opEncode!, ctx.argPerm) : chunk.code;
 
   const dataK = serializeConstants(chunk.K, ctx);
   const dataC = serializeRegCode(mappedCode, ctx);
@@ -3426,6 +3451,8 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
   const dK = level === "debug" ? "_dK" : randomName(3);
   const dC = level === "debug" ? "_dC" : randomName(3);
   const dP = level === "debug" ? "_dP" : randomName(3);
+  // STEP 1: root proto's decode table for the entry call
+  const dDT = level === "debug" ? "_dDT" : randomName(3);
 
   const nP = chunk.nParams ?? 0;
   const mR = chunk.maxRegs ?? 0;
@@ -3445,7 +3472,9 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
     parts.push(`local ${dK}=${dataK}`);
     parts.push(`local ${dC}=${dataC}`);
     parts.push(`local ${dP}=${dataP}`);
-    parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env})`);
+    // STEP 1: pass root decode table
+    parts.push(`local ${dDT}=${serializeProtoDecodeTable(chunk, rng)}`);
+    parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env},${dDT})`);
     output = parts.join("\n");
   } else {
 
@@ -3472,10 +3501,13 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
     const vmCode = buildVMRuntime(ctx, true);
     allFragments.push({ code: vmCode, layer: Math.floor(rng() * 3) });
 
-    forwardDecls.push(dK, dC, dP);
+    forwardDecls.push(dK, dC, dP, dDT);
     allFragments.push({ code: `${dK}=${dataK}`, layer: Math.floor(rng() * 3) });
     allFragments.push({ code: `${dC}=${dataC}`, layer: Math.floor(rng() * 3) });
     allFragments.push({ code: `${dP}=${dataP}`, layer: Math.floor(rng() * 3) });
+    // STEP 1: root proto decode table for entry
+    const rootDTLiteral = serializeProtoDecodeTable(chunk, rng);
+    allFragments.push({ code: `${dDT}=${rootDTLiteral}`, layer: Math.floor(rng() * 3) });
 
     let chainCalls = "";
     if (encodeStrings) {
@@ -3638,7 +3670,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
         const wParts = chkVars.map(([l,v]) => `"${l}="..tostring(${v})`);
         parts.push(`warn("[ENV_CHECK] "..${wParts.join('.." "..') })`);
       }
-      parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env})`);
+      parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env},${dDT})`);
     } else {
 
       for (const frag of sorted) {
@@ -3656,7 +3688,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
         const wParts = chkVars.map(([l,v]) => `"${l}="..tostring(${v})`);
         parts.push(`warn("[ENV_CHECK] "..${wParts.join('.." "..') })`);
       }
-      parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env})`);
+      parts.push(`return ${names.run}(${dK},${dC},${dP},{},${nP},${mR},${isVA},${names.env},${dDT})`);
     }
 
     output = parts.join("\n");
@@ -3679,7 +3711,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
       xorKey,
       invSbox,
       checksum,
-      chunkName: "Clyde",
+      chunkName: "Xanax",
       rng,
     });
     console.log(`[RegVM] Blob: final output = ${output.length} chars`);
@@ -3694,7 +3726,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
       ` \\______  /____/ ____\\____ |\\___  >  |____|     |__|   \\____/|__|  \\___  >\\___  >__| |__|\\____/|___|  /    \\___/   \\_______ \\`,
       `        \\/     \\/         \\/    \\/                                     \\/     \\/                    \\/                     \\/`,
       ``,
-      `https://clydeprotectionde.cloud | ClydeProtection Just like VMProtect, but for Lua.`,
+      `https://xanax-obfuscator.github.io | Xanax Protection Just like VMProtect, but for Lua.`,
     ];
     output = `--[[\n${art.join('\n')}\n]]\n` + output;
   }
