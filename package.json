@@ -5,8 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
+    "build": "node node_modules/typescript/bin/tsc",
+    "dev": "node node_modules/typescript/bin/tsc --watch",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "lex": "npm run build && node dist/cli/lex.js",
     "parse": "npm run build && node dist/cli/parse.js",
