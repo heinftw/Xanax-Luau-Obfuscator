@@ -2,7 +2,6 @@ import { RegOp, REG_OPCODE_COUNT, RK_OFFSET } from "./bytecode.js";
 import type { RegBytecodeChunk, Constant } from "./bytecode.js";
 import { randomBytes } from "crypto";
 import { writeFileSync as _dumpWrite } from "fs";
-import { encryptAndEncode, compressToBase85, compressBytesToBase85 } from "./lzma.js";
 import { generateBootstrap } from "./bootstrap-template.js";
 import {
   applyPerProtoOpcodes,
@@ -1166,15 +1165,16 @@ function buildHandlerBodies(n: NameMap, ctx: BuildCtx, usedOps?: Set<number>): M
   for (const [op, gen] of handlerRegistry) {
 
     if (usedOps && !usedOps.has(op as number)) continue;
-    const shuffled = ctx.opcodeEncode[op as number];
     const body = gen(n, ctx);
 
-    const p = ctx.argPerm[op as number];
+    // After the per-proto decode table, the dispatch opcode is canonical.
+    // Argument slots are only rotated when the bytecode itself was remapped.
+    const p = ctx.doShuffle ? ctx.argPerm[op as number] : [1, 2, 3];
     const slots = [n.s1, n.s2, n.s3];
     const remap = `local A,B,C=${slots[p[0]-1]},${slots[p[1]-1]},${slots[p[2]-1]};`;
 
     const noise = doNoise ? generateHandlerNoise(n, op as number) : '';
-    bodies.set(shuffled, remap + noise + body);
+    bodies.set(op as number, remap + noise + body);
   }
   return bodies;
 }
@@ -1313,7 +1313,7 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
   L.push(`${n.protos}=${n.protos} or {}`);
   L.push(`${n.upvalues}=${n.upvalues} or {}`);
   // STEP 1: per-proto decode table - _decodeTbl is the table for THIS function
-  L.push(`local _D=_decodeTbl or nil`);
+  L.push(`local __dt=_decodeTbl or nil`);
 
   L.push(`local ${n.R}=${n.bTcreate}(${n.maxRegs}+1)`);
 
@@ -1375,7 +1375,7 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
       RegOp.DIV as number, RegOp.MOD as number, RegOp.POW as number,
       RegOp.IDIV as number,
     ];
-    const hotShuffled = new Set(hotRawOps.map(op => ctx.opcodeEncode[op]));
+    const hotShuffled = new Set(hotRawOps);
     const rkEsc = n.RK.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const rkRe = new RegExp(rkEsc + '\\(([A-Z])\\)', 'g');
     for (const [sOp, body] of bodies) {
@@ -1388,10 +1388,7 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
   }
 
   if (ctx.debugTrace) {
-    const entries = REG_OP_NAMES.map((name, realOp) => {
-      const shuffled = ctx.opcodeEncode[realOp];
-      return `[${shuffled}]="${name}"`;
-    }).join(",");
+    const entries = REG_OP_NAMES.map((name, realOp) => `[${realOp}]="${name}"`).join(",");
     L.push(`local _opNames={${entries}}`);
   }
 
@@ -1520,8 +1517,9 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
       L.push(`local ${opVar}=${n.bBxor}(${n.code}[${n.ip}],${mkVar})`);
     }
 
-    // STEP 1: decode wire opcode through per-function decode table
-    L.push(`if _D then ${opVar}=_D[${opVar}+1]-1 or ${opVar} end`);
+    // STEP 1: decode wire opcode through per-function decode table.
+    // The table stores canonical = decode[wire] at index wire+1. Do not subtract again.
+    L.push(`if __dt then ${opVar}=__dt[${opVar}+1] or ${opVar} end`);
     L.push(`local ${n.s1}=${n.code}[${n.ip}+1]`);
     L.push(`local ${n.s2}=${n.code}[${n.ip}+2]`);
     L.push(`local ${n.s3}=${n.code}[${n.ip}+3]`);
@@ -1541,8 +1539,9 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
     } else {
       L.push(`local ${opVar}=${n.code}[${n.ip}]`);
     }
-    // STEP 1: decode wire opcode through per-function decode table
-    L.push(`if _D then ${opVar}=_D[${opVar}+1]-1 or ${opVar} end`);
+    // STEP 1: decode wire opcode through per-function decode table.
+    // The table stores canonical = decode[wire] at index wire+1. Do not subtract again.
+    L.push(`if __dt then ${opVar}=__dt[${opVar}+1] or ${opVar} end`);
     L.push(`local ${n.s1}=${n.code}[${n.ip}+1]`);
     L.push(`local ${n.s2}=${n.code}[${n.ip}+2]`);
     L.push(`local ${n.s3}=${n.code}[${n.ip}+3]`);
@@ -1687,13 +1686,13 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
   } else if (dv === 4 || dv === 5) {
 
     const hTbl = n.handlers;
-    const retOp = ctx.opcodeEncode[RegOp.RETURN as number];
-    const tcOp = ctx.opcodeEncode[RegOp.TAILCALL as number];
+    const retOp = RegOp.RETURN as number;
+    const tcOp = RegOp.TAILCALL as number;
 
     const mandatoryFast = [
       RegOp.JMP as number, RegOp.FORLOOP as number, RegOp.CALL as number,
       RegOp.MOVE as number, RegOp.FORPREP as number,
-    ].map(op => ctx.opcodeEncode[op]);
+    ];
 
     const optCandidates = [
       RegOp.LOADK as number, RegOp.GETGLOBAL as number,
@@ -1708,7 +1707,7 @@ function buildVMRuntime(ctx: BuildCtx, assignStyle: boolean = false): string {
     const nFast = 2 + Math.floor(rng() * 2);
     const fastSet = new Set([
       ...mandatoryFast,
-      ...shuffledCands.slice(0, nFast).map(op => ctx.opcodeEncode[op]),
+      ...shuffledCands.slice(0, nFast),
     ]);
 
     const inlineOps = new Set([retOp, tcOp, ...fastSet]);
@@ -3701,20 +3700,13 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
 
   if (level !== "debug" && process.env.NO_CIPHER !== '1') {
     const vmRawLen = Buffer.byteLength(output, 'utf-8');
-    console.log(`[RegVM] Blob: encrypting VM runtime (${vmRawLen} bytes)...`);
-    const { blob: vmBlob, xorKey, invSbox, checksum, origLen: vmOrigLen } = encryptAndEncode(output, rng);
-    console.log(`[RegVM] Blob: VM blob = ${vmBlob.length} chars (SBox+CBC+Base85), key=${xorKey.length}B, checksum=${checksum}`);
-
+    console.log(`[RegVM] Blob: packing VM runtime (${vmRawLen} bytes) through deser pipeline...`);
     output = generateBootstrap({
-      vmBlob,
-      vmOrigLen,
-      xorKey,
-      invSbox,
-      checksum,
+      vmSource: output,
       chunkName: "Xanax",
       rng,
     });
-    console.log(`[RegVM] Blob: final output = ${output.length} chars`);
+    console.log(`[RegVM] Blob: final output = ${output.length} chars (decode→decrypt→inflate→deser→transform→load)`);
   }
 
   if (false && !options._noWatermark) {
@@ -3731,8 +3723,7 @@ export function generateRegVM(chunk: RegBytecodeChunk, options: RegVMGenOptions 
     output = `--[[\n${art.join('\n')}\n]]\n` + output;
   }
 
-  if (level !== "debug") {
-
+  if (level !== "debug" && output.startsWith("--[[")) {
     const watermarkEnd = output.indexOf(']]\n');
     if (watermarkEnd !== -1) {
       const watermark = output.substring(0, watermarkEnd + 3);

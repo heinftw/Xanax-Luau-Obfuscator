@@ -79,11 +79,14 @@ export function applyPerProtoOpcodes(
   enabled: boolean
 ): ProtoOpcodeEntry[] {
   if (!enabled) {
-    // Still assign identity tables so the runtime side can index uniformly.
+    // Identity tables: debug bytecode is not remapped, so decode must be a no-op.
     const refs = walkProtoTree(root, masterSeed, REG_OPCODE_COUNT);
+    const ident = Array.from({ length: REG_OPCODE_COUNT }, (_, i) => i);
     for (const r of refs) {
-      r.chunk.opEncode = r.encode;
-      r.chunk.opDecode = r.decode;
+      r.encode = ident;
+      r.decode = ident;
+      r.chunk.opEncode = ident;
+      r.chunk.opDecode = ident;
       r.chunk.perProtoApplied = true;
     }
     return refs;
@@ -176,7 +179,7 @@ export function serializeProtoDecodeTable(
     const hi = Math.min(decode.length, lo + size);
     if (lo >= hi) break;
     const entries: string[] = [];
-    for (let k = lo; k < hi; k++) entries.push(`${k - lo + 1}=${decode[k] + 1}`);
+    for (let k = lo; k < hi; k++) entries.push(`[${k - lo + 1}]=${decode[k] + 1}`);
     chunks.push(`{${entries.join(',')}}`);
   }
 
